@@ -28,7 +28,15 @@ void itlmt7922::m1log(const char *fmt, ...)
     va_end(ap);
     IOLog("itlmt7922: M1 %s\n", tmp);
     size_t n = strlen(tmp);
-    if (m1len + n + 2 < sizeof(m1buf)) {
+    if (n + 2 < sizeof(m1buf)) {
+        // Ring: the old append-only buffer stopped at full, which hid the last MCU commands of a failing connect.
+        while (m1len + n + 2 >= sizeof(m1buf)) {
+            char *sep = (char *)memchr(m1buf, ';', m1len);
+            size_t cut = sep ? (size_t)(sep - m1buf) + 1 : m1len;
+            memmove(m1buf, m1buf + cut, m1len - cut);
+            m1len -= cut;
+            m1buf[m1len] = 0;
+        }
         memcpy(m1buf + m1len, tmp, n);
         m1len += n;
         m1buf[m1len++] = ';';
