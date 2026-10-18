@@ -13,8 +13,13 @@ static inline void put16(uint8_t *p,uint16_t v) { memcpy(p,&v,2); }
 static inline void put32(uint8_t *p,uint32_t v) { memcpy(p,&v,4); }
 static inline void barrier() { __sync_synchronize(); }
 static const uint32_t kCe=1u<<18,kUni=1u<<17,kQuery=1u<<16;
+// 2.4 GHz + 5 GHz non-DFS, exactly the list that was verified on hardware: a DFS channel in this request could make the
+// firmware reject the whole scan, so the DFS block is kept apart and scanned in a second passive pass (5 GHz hotspots whose
+// channel is on DFS never showed up in the scan at all). The request carries at most 32 channel entries.
 static const uint8_t chans[][2]={{1,1},{1,2},{1,3},{1,4},{1,5},{1,6},{1,7},{1,8},{1,9},{1,10},{1,11},{1,12},{1,13},
  {2,36},{2,40},{2,44},{2,48},{2,149},{2,153},{2,157},{2,161},{2,165}};
+static const uint8_t chansDfs[][2]={{2,52},{2,56},{2,60},{2,64},
+ {2,100},{2,104},{2,108},{2,112},{2,116},{2,120},{2,124},{2,128},{2,132},{2,136},{2,140},{2,144}};
 
 bool itlmt7922::ringPeek(itl_ring &r,const uint8_t **data,uint32_t *length,int *index)
 {
@@ -157,17 +162,28 @@ void itlmt7922::rxParseFrame(const uint8_t *p,uint32_t length)
 }
 int itlmt7922::m2Scan(const char *ssid)
 {
+    int rc = m2ScanPass(ssid, 0);
+    if (ssid) return rc;                                  // a directed scan only needs the primary list
+    int rcDfs = m2ScanPass(nullptr, 1);                   // UNII-2C DFS block
+    return rc ? rc : rcDfs;
+}
+
+int itlmt7922::m2ScanPass(const char *ssid, int part)
+{
     if (shouldStop() || firmwareFault) return -5;
     const size_t sl=ssid?strnlen(ssid,33):0;
-    if (sl>32) return -22;
+    if (sl>32 || (part && sl)) return -22;
+    const uint8_t (*list)[2] = part ? chansDfs : chans;
+    const unsigned count = part ? (unsigned)(sizeof(chansDfs)/sizeof(chansDfs[0]))
+                                : (unsigned)(sizeof(chans)/sizeof(chans[0]));
     uint8_t scan[1186]={};
     scanSeq=(uint8_t)((scanSeq+1)&0x7f); if (!scanSeq) scanSeq=1;
     scan[0]=scanSeq; scan[2]=sl?1:0; scan[3]=sl?4:1;
     scan[4]=sl?1:0; scan[5]=sl?2:0; scan[6]=1u<<5; scan[7]=1;
     if (sl) { put32(scan+8,(uint32_t)sl); memcpy(scan+12,ssid,sl); scan[1185]=1; }
-    put16(scan+154,120); put16(scan+156,120*(uint16_t)(sizeof(chans)/2));
-    scan[158]=4; scan[159]=(uint8_t)(sizeof(chans)/2);
-    memcpy(scan+160,chans,sizeof(chans)); put16(scan+828,60); memset(scan+1110,255,6);
+    put16(scan+154,120); put16(scan+156,120*(uint16_t)count);
+    scan[158]=4; scan[159]=(uint8_t)count;
+    memcpy(scan+160,list,count*2); put16(scan+828,60); memset(scan+1110,255,6);
     scanDone=false; bzero(chHist,sizeof(chHist));
     int rc=mcuSend(kCe|3,scan,sizeof(scan),false,nullptr);
     m2log("CE scan submit rc=%d seq=%u directed=%u",rc,scanSeq,sl?1:0);
