@@ -106,13 +106,42 @@ enum LoginItem {
     static var plist: URL { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/\(label).plist") }
     static var enabled: Bool { FileManager.default.fileExists(atPath: plist.path) }
     static func set(_ on: Bool) {
-        if !on { try? FileManager.default.removeItem(at: plist); return }
+        if !on {
+            launchctl(["bootout", "gui/\(getuid())", plist.path])
+            try? FileManager.default.removeItem(at: plist)
+            return
+        }
         let exe = Bundle.main.executablePath ?? CommandLine.arguments[0]
         let d: [String: Any] = ["Label": label, "ProgramArguments": [exe], "RunAtLoad": true, "ProcessType": "Interactive",
                                 "LimitLoadToSessionType": "Aqua"]
         try? FileManager.default.createDirectory(at: plist.deletingLastPathComponent(), withIntermediateDirectories: true)
         (d as NSDictionary).write(to: plist, atomically: true)
+        // Load it now instead of at the next login; a second instance exits on its own (see singleInstance).
+        launchctl(["bootout", "gui/\(getuid())", plist.path])
+        launchctl(["bootstrap", "gui/\(getuid())", plist.path])
     }
+    private static func launchctl(_ args: [String]) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        p.waitUntilExit()
+    }
+}
+
+// One menu bar icon, one auto-join loop: a LaunchAgent copy and a Finder copy must not both run.
+private var instanceLock: Int32 = -1
+func claimSingleInstance() -> Bool {
+    let dir = SavedStore.dir
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    let path = dir.appendingPathComponent(".lock").path
+    let fd = open(path, O_CREAT | O_RDWR, 0o600)
+    guard fd >= 0 else { return true }                      // no lock file: do not block the app
+    if flock(fd, LOCK_EX | LOCK_NB) != 0 { return false }
+    instanceLock = fd
+    return true
 }
 
 // ---- model -----------------------------------------------------------------------------------------------------------------
@@ -130,8 +159,9 @@ final class WifiModel: ObservableObject {
     @Published var loginEnabled = LoginItem.enabled
     @Published var saved = SavedStore.load()    // ssid -> passphrase
     @Published var order: [String] = []         // SSIDs in the order the list shows them (see updateOrder)
+    @Published var scanPending = false          // a scan was requested and has not been reflected yet
     var drafts: [String: String] = [:]          // what was typed in the join form, kept while the app runs ("" key: Other Network)
-    var pending: (ssid: String, psk: String, remember: Bool)?
+    @Published var pending: (ssid: String, psk: String, remember: Bool)?
     var userOff = false
     var autoTried = Set<String>()
     var onChange: (() -> Void)?
@@ -156,27 +186,30 @@ final class WifiModel: ObservableObject {
     }
 
     var connected: Bool { st.state == "connected" }
-    var busy: Bool { st.state == "connecting" || st.state == "scanning" }
+    var busy: Bool { st.state == "connecting" || st.state == "scanning" || scanPending }
     var connectingSSID: String? { pending != nil && !connected ? pending?.ssid : nil }
 
     func refresh() {
         let old = st
         st = Driver.status()
         let rescanned = st.scanGen != old.scanGen
+        if rescanned { scanPending = false }
         updateOrder(force: reorderNext && rescanned)
         if reorderNext && rescanned { reorderNext = false }
         if let p = pending {
             let fresh = st.events.filter { !eventsAtJoin.contains($0) }
             if connected && st.ssid == p.ssid {
                 if p.remember { saved[p.ssid] = p.psk; SavedStore.save(saved) }
+                drafts[p.ssid] = nil
                 pending = nil; message = nil
                 if joinTarget != nil { joinTarget = nil }
             } else if !failShown, let why = fresh.last(where: { Self.isFailure($0) }) {
                 failShown = true
+                pending = nil                    // a rejected password is not "still connecting": clear the spinner
                 message = "Could not join \(p.ssid): " + Self.friendly(why)
-            } else if Date().timeIntervalSince(pendingSince) > 60 && !busy {
+            } else if Date().timeIntervalSince(pendingSince) > 45 && !busy {
                 pending = nil
-                if !failShown { message = "Could not join \(p.ssid): no answer from the access point." }
+                if !failShown { message = "Could not join \(p.ssid): the access point did not answer in time. Try again once the network is back in the list." }
             }
         }
         if (st.state == "idle" || st.state == "failed") && !userOff && pending == nil && rescanned { autoJoin() }
@@ -213,13 +246,33 @@ final class WifiModel: ObservableObject {
         }
     }
 
-    var rows: [WifiNet] { order.compactMap { seen[$0] }.filter { !(connected && $0.ssid == st.ssid) } }
+    // The status row already shows the current / pending network; keeping it in the list too made it appear twice.
+    var rows: [WifiNet] {
+        order.compactMap { seen[$0] }.filter { n in
+            if connected && n.ssid == st.ssid { return false }
+            if let p = connectingSSID, n.ssid == p { return false }
+            return true
+        }
+    }
 
     // ---- actions ----------------------------------------------------------------------------------------------------------
     func scan() {
         reorderNext = true
         let kr = Driver.call(.scan)
-        if kr != KERN_SUCCESS && kr != kIOReturnBusy { message = "Scan failed: " + explain(kr) }
+        if kr == KERN_SUCCESS || kr == kIOReturnBusy {
+            // The kext refuses a second scan within 10 s (the radio has to leave the AP's channel), so a click can be a
+            // no-op. Show that something was asked for, then refresh twice: the scan usually lands well inside 3 s.
+            scanPending = true
+            for delay in [1.2, 3.0] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self else { return }
+                    self.refresh()
+                    if delay == 3.0 { self.scanPending = false }
+                }
+            }
+        } else {
+            message = "Scan failed: " + explain(kr)
+        }
     }
 
     func select(_ n: WifiNet) {
@@ -284,18 +337,20 @@ final class WifiModel: ObservableObject {
         }
     }
 
-    // wifi-events lines that mean the attempt failed, and what they mean in words
-    static func isFailure(_ line: String) -> Bool {
-        line.contains("connect failed") || line.contains("failed rc=") || line.contains("no configured network") || line.contains("lost after")
-    }
+    // wifi-events lines that mean the attempt failed, and what they mean in words. The driver writes the short forms
+    // (auth-fail, assoc-fail, hs-fail, roc-fail, hw-prep-fail, link lost); matching only "failed" missed every one of them,
+    // so a rejected password surfaced as a timeout instead of the reason.
+    static let failureMarks = ["connect failed", "failed rc=", "no configured network", "lost after", "link lost",
+                               "auth-fail", "assoc-fail", "hs-fail", "roc-fail", "hw-prep-fail", "key handshake failed"]
+    static func isFailure(_ line: String) -> Bool { failureMarks.contains { line.contains($0) } }
     static func friendly(_ line: String) -> String {
         if line.contains("hw-prep-fail") { return "the driver could not set up the radio. Restart the Mac so the updated driver loads." }
         if line.contains("roc-fail") { return "the access point did not answer on its channel. Move closer and try again." }
-        if line.contains("auth-fail") { return "the access point rejected the connection." }
-        if line.contains("assoc-fail") { return "the access point refused the association." }
+        if line.contains("auth-fail") { return "the access point rejected the sign-in. Check that the password is current." }
+        if line.contains("assoc-fail") { return "the access point refused the association. Try again in a moment." }
         if line.contains("hs-fail") || line.contains("handshake") { return "the password was not accepted (or the key exchange failed)." }
         if line.contains("no configured network") || line.contains("nocred") { return "the network is not in range." }
-        if line.contains("lost after") { return "the connection dropped." }
+        if line.contains("lost after") || line.contains("link lost") { return "the connection dropped." }
         return line.drop(while: { $0.isNumber || $0 == "s" }).trimmingCharacters(in: .whitespaces)
     }
 }
@@ -329,11 +384,13 @@ struct HoverRow<Content: View>: View {
 struct SignalIcon: View {
     let rssi: Int
     var active = false
+    var slashed = false
     var body: some View {
         ZStack {
             Circle().fill(active ? Color.accentColor : Color.primary.opacity(0.1)).frame(width: 26, height: 26)
-            Image(systemName: "wifi", variableValue: bars(rssi))
-                .font(.system(size: 12, weight: .semibold)).foregroundStyle(active ? .white : .primary)
+            Image(systemName: slashed ? "wifi.slash" : "wifi", variableValue: bars(rssi))
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(active ? Color.white : (slashed ? Color.secondary : Color.primary))
         }
     }
 }
@@ -375,7 +432,8 @@ struct JoinView: View {
                 }
                 .textFieldStyle(.roundedBorder).focused($focus, equals: .psk).onSubmit(go)
                 Button { reveal.toggle() } label: { Image(systemName: reveal ? "eye.slash" : "eye") }
-                    .buttonStyle(.borderless).help(reveal ? "Hide password" : "Show password")
+                    .buttonStyle(.borderless).frame(width: 22, height: 22).contentShape(Rectangle())
+                    .help(reveal ? "Hide password" : "Show password")
             }
             Toggle("Remember this network", isOn: $remember).toggleStyle(.checkbox).font(.system(size: 12))
 
@@ -394,7 +452,7 @@ struct JoinView: View {
                 }
                 Spacer()
                 Button("Cancel") { m.message = nil; m.joinTarget = nil }.controlSize(.regular)
-                Button(attempting ? "Connecting…" : "Join", action: go).controlSize(.regular)
+                Button("Join", action: go).controlSize(.regular)
                     .keyboardShortcut(.defaultAction).disabled(!valid || attempting)
             }
         }
@@ -477,9 +535,12 @@ struct NetworkRow: View {
                     Text(n.ssid).font(.system(size: 13)).lineLimit(1).foregroundStyle(n.joinable ? .primary : .secondary)
                     Text(sub).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
                 }
-                Spacer()
-                if connecting { ProgressView().controlSize(.small) }
-                else if n.locked { Image(systemName: "lock.fill").font(.system(size: 10)).foregroundStyle(.secondary) }
+                Spacer(minLength: 6)
+                // One trailing column width for the lock, the spinner and the row menu, so the icons line up.
+                if connecting { ProgressView().controlSize(.small).frame(width: 24) }
+                else if n.locked {
+                    Image(systemName: "lock.fill").font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 24)
+                }
             }
         }
         .contextMenu {
@@ -506,106 +567,163 @@ struct NetworkRow: View {
     }
 }
 
+private struct ListHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
 struct ContentView: View {
     @ObservedObject var m: WifiModel
     let showSpeedTest: () -> Void
-    var statusLine: String {
+    @State private var listContentHeight: CGFloat = 0
+    private let maxListHeight: CGFloat = 316
+    private let rowHeight: CGFloat = 39.5
+
+    // Used for the one layout pass before the measured height arrives; otherwise the popover opens taller than it ends up.
+    var estimatedListHeight: CGFloat {
+        min(CGFloat(m.rows.count + 1) * rowHeight + (m.rows.isEmpty ? 30 : 0), maxListHeight)
+    }
+
+    var statusTitle: String {
         switch m.st.state {
-        case "connected": return m.st.ssid
+        case "connected": return m.st.ssid.isEmpty ? "Connected" : m.st.ssid
         case "connecting": return m.st.ssid.isEmpty ? "Connecting…" : "Connecting to \(m.st.ssid)…"
         case "scanning": return "Scanning…"
-        case "failed": return "Not connected"
-        case "off": return "Off (boot-arg itlmt_m3=1 missing)"
+        case "off": return "Wi-Fi is off"
         case "absent": return "Driver not loaded"
+        case "worker-failed": return "Driver stopped"
+        case "firmware-failed": return "Firmware did not start"
+        case "failed": return "Not connected"
         default: return "Not connected"
         }
     }
+
+    var statusDetail: String? {
+        if m.connected {
+            return "Channel \(m.st.channel)" + (m.st.rssi == 0 ? "" : " · \(m.st.rssi) dBm") + " · max ≈\(m.st.rate) Mb/s"
+        }
+        // wifi-error is only written when something fails, so during a retry it still holds the previous reason.
+        if m.st.state == "connecting" || m.st.state == "scanning" { return nil }
+        if !m.st.error.isEmpty {
+            // The driver writes its own short forms (hw-prep-fail, auth-fail, …); say what they mean.
+            let text = WifiModel.isFailure(m.st.error) ? WifiModel.friendly(m.st.error) : m.st.error
+            return text.prefix(1).uppercased() + text.dropFirst()
+        }
+        switch m.st.state {
+        case "off": return "The radio was not enabled. Add itlmt_m3=1 to boot-args and restart."
+        case "absent": return "Install itlmt7922.kext in OpenCore/Kexts and restart, then open this menu again."
+        case "worker-failed", "firmware-failed": return "Restart the Mac to reload the driver."
+        default: return nil
+        }
+    }
+
     var body: some View {
         if let t = m.joinTarget { JoinView(m: m, target: t) } else { list }
     }
 
     var list: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
+            HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Wi-Fi").font(.system(size: 13, weight: .semibold))
                     Text("MediaTek MT7922 · itlmt7922").font(.system(size: 10)).foregroundStyle(.secondary)
                 }
-                Spacer()
-                if m.busy { ProgressView().controlSize(.small) }
-                Button { m.scan() } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.borderless).help("Scan now").disabled(!m.st.present)
+                Spacer(minLength: 8)
+                if m.busy { ProgressView().controlSize(.small).scaleEffect(0.8) }
+                Button { m.scan() } label: {
+                    Image(systemName: "arrow.clockwise").font(.system(size: 13, weight: .medium))
+                        .frame(width: 24, height: 24).contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless).help("Scan now").disabled(!m.st.present)
             }
             .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 6)
 
-            if m.st.present && m.st.state != "absent" {
-                HoverRow(action: nil) {
-                    HStack(spacing: 10) {
-                        SignalIcon(rssi: m.st.rssi, active: m.connected)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(statusLine).font(.system(size: 13, weight: .medium)).lineLimit(1)
-                            if m.connected {
-                                Text("Channel \(m.st.channel)" + (m.st.rssi == 0 ? "" : " · \(m.st.rssi) dBm") + " · max ≈\(m.st.rate) Mb/s")
-                                    .font(.system(size: 11)).foregroundStyle(.secondary)
-                            } else if !m.st.error.isEmpty {
-                                Text(m.st.error).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
-                            }
-                        }
-                        Spacer()
-                        if m.connected || m.busy {
-                            Menu { currentActions } label: { Image(systemName: "ellipsis.circle") }
-                                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            HoverRow(action: nil) {
+                HStack(spacing: 10) {
+                    SignalIcon(rssi: m.st.rssi, active: m.connected,
+                               slashed: !m.st.present || m.st.state == "off")
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(statusTitle).font(.system(size: 13, weight: .medium)).lineLimit(1)
+                        if let detail = statusDetail {
+                            Text(detail).font(.system(size: 10)).foregroundStyle(.secondary)
+                                .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                         }
                     }
+                    Spacer(minLength: 6)
+                    if m.connected || m.busy {
+                        Menu { currentActions } label: {
+                            Image(systemName: "ellipsis.circle").font(.system(size: 14))
+                                .frame(width: 24, height: 24).contentShape(Rectangle())
+                        }
+                        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
+                        .fixedSize().help("Network actions")
+                    }
                 }
-                .contextMenu { if m.connected || m.busy { currentActions } }
-            } else {
-                Text(statusLine).font(.system(size: 12)).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.vertical, 6)
             }
+            .contextMenu { if m.connected || m.busy { currentActions } }
 
             if let msg = m.message {
                 HStack(alignment: .top, spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                        .font(.system(size: 11))
                     Text(msg).font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
-                    Spacer()
-                    Button { m.message = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless)
+                    Spacer(minLength: 4)
+                    Button { m.message = nil } label: {
+                        Image(systemName: "xmark").font(.system(size: 10, weight: .medium))
+                            .frame(width: 18, height: 18).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.borderless).help("Dismiss")
                 }
                 .padding(8).background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.12)))
                 .padding(.horizontal, 14).padding(.vertical, 4)
             }
 
-            SectionTitle(text: "Networks")
-            ScrollView {
-                VStack(spacing: 0) {
-                    if m.rows.isEmpty {
-                        Text("No networks found yet").font(.system(size: 12)).foregroundStyle(.secondary)
-                            .padding(.horizontal, 14).padding(.vertical, 6).frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    ForEach(m.rows.prefix(30), id: \.ssid) { n in NetworkRow(m: m, n: n) }
-                    HoverRow(action: { m.message = nil; m.joinTarget = .other }) {
-                        HStack(spacing: 10) {
-                            ZStack { Circle().fill(Color.primary.opacity(0.1)).frame(width: 26, height: 26)
-                                     Image(systemName: "ellipsis").font(.system(size: 12, weight: .semibold)) }
-                            Text("Other Network…").font(.system(size: 13))
-                            Spacer()
+            if m.st.present {
+                SectionTitle(text: "Networks")
+                networkList
+            }
+
+            Divider().padding(.top, 6)
+            HStack(spacing: 10) {
+                Toggle("Open at Login", isOn: Binding(get: { m.loginEnabled }, set: { m.setLogin($0) }))
+                    .toggleStyle(.switch).controlSize(.mini).font(.system(size: 11))
+                Spacer(minLength: 10)
+                Link("by thanhnndev", destination: URL(string: "https://github.com/thanhnndev")!)
+                    .font(.system(size: 10)).foregroundStyle(.secondary).help("github.com/thanhnndev")
+                Button("Quit") { NSApp.terminate(nil) }.buttonStyle(.borderless).font(.system(size: 11))
+                    .padding(.leading, 2)
+            }
+            .padding(.horizontal, 14).padding(.vertical, 7)
+        }
+        .frame(width: 330)
+    }
+
+    // The list is as tall as its rows (up to maxListHeight) instead of a fixed 300: with two networks the old fixed
+    // height left ~200 pt of empty popover under the last row, and always cut the last row in half when it overflowed.
+    var networkList: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                if m.rows.isEmpty {
+                    Text(m.busy ? "Scanning…" : "No networks found yet")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .padding(.horizontal, 14).padding(.vertical, 8).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                ForEach(m.rows.prefix(30), id: \.ssid) { n in NetworkRow(m: m, n: n) }
+                HoverRow(action: { m.message = nil; m.joinTarget = .other }) {
+                    HStack(spacing: 10) {
+                        ZStack {
+                            Circle().fill(Color.primary.opacity(0.08)).frame(width: 26, height: 26)
+                            Image(systemName: "ellipsis").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
                         }
+                        Text("Other Network…").font(.system(size: 13)).foregroundStyle(.secondary)
+                        Spacer(minLength: 0)
                     }
                 }
             }
-            .frame(height: 300)          // fixed: a list that grows or shrinks would move rows under the pointer
-
-            Divider().padding(.top, 6)
-            HStack {
-                Toggle("Open at Login", isOn: Binding(get: { m.loginEnabled }, set: { m.setLogin($0) }))
-                    .toggleStyle(.switch).controlSize(.mini).font(.system(size: 12))
-                Spacer()
-                Link("by thanhnndev", destination: URL(string: "https://github.com/thanhnndev")!)
-                    .font(.system(size: 11)).foregroundStyle(.secondary).help("github.com/thanhnndev")
-                Button("Quit") { NSApp.terminate(nil) }.buttonStyle(.borderless).font(.system(size: 12))
-            }
-            .padding(.horizontal, 14).padding(.vertical, 8)
+            .background(GeometryReader { g in Color.clear.preference(key: ListHeightKey.self, value: g.size.height) })
         }
-        .frame(width: 330)
+        .frame(height: listContentHeight > 0 ? min(listContentHeight, maxListHeight) : estimatedListHeight)
+        .onPreferenceChange(ListHeightKey.self) { listContentHeight = $0 }
     }
 
     @ViewBuilder var currentActions: some View {
@@ -642,7 +760,7 @@ struct SpeedTestView: View {
 
 // ---- status item -------------------------------------------------------------------------------------------------------------
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let popover = NSPopover()
     let model = WifiModel()
@@ -651,6 +769,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         popover.behavior = .transient
         popover.animates = false
+        popover.delegate = self
         popover.contentViewController = NSHostingController(rootView: ContentView(m: model, showSpeedTest: { [weak self] in self?.showSpeedTest() }))
         item.button?.target = self
         item.button?.action = #selector(toggle)
@@ -665,6 +784,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.updateOrder(force: true)
         popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
+    }
+
+    // Closing the popover goes back to the list: reopening it on the half-filled password form was easy to mistake for a
+    // stuck window. Typed text is still kept in WifiModel.drafts.
+    func popoverDidClose(_ n: Notification) {
+        model.joinTarget = nil
+        model.message = nil
     }
 
     func showSpeedTest() {
@@ -695,9 +821,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let img = NSImage(systemSymbolName: name, variableValue: value, accessibilityDescription: "Wi-Fi")
         img?.isTemplate = true
+        img?.size = NSSize(width: 17, height: 17)      // an unsized symbol sits small and high in the menu bar
         b.image = img
         b.alphaValue = alpha
-        let tip = s.state == "connected" ? "\(s.ssid) · channel \(s.channel)" + (s.rssi == 0 ? "" : " · \(s.rssi) dBm") : s.state
+        let tip: String
+        switch s.state {
+        case "connected": tip = "\(s.ssid) · channel \(s.channel)" + (s.rssi == 0 ? "" : " · \(s.rssi) dBm")
+        case "connecting": tip = s.ssid.isEmpty ? "Connecting…" : "Connecting to \(s.ssid)…"
+        case "scanning": tip = "Scanning…"
+        case "off": tip = "Wi-Fi is off (itlmt_m3=1 missing)"
+        case "absent": tip = "itlmt7922 is not loaded"
+        case "worker-failed", "firmware-failed": tip = "The driver stopped"
+        default: tip = "Not connected"
+        }
         b.toolTip = tip
     }
 }
@@ -706,6 +842,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct ItlWiFi7922Main {
     static func main() {
         MainActor.assumeIsolated {
+            guard claimSingleInstance() else { return }   // a LaunchAgent copy and a manual copy must not both run
             let app = NSApplication.shared
             let delegate = AppDelegate()
             app.delegate = delegate
