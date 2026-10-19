@@ -639,7 +639,10 @@ struct ContentView: View {
     }
 
     var body: some View {
-        if let t = m.joinTarget { JoinView(m: m, target: t) } else { list }
+        Group {
+            if let t = m.joinTarget { JoinView(m: m, target: t) } else { list }
+        }
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     var list: some View {
@@ -791,7 +794,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.behavior = .transient
         popover.animates = false
         popover.delegate = self
-        popover.contentViewController = NSHostingController(rootView: ContentView(m: model, showSpeedTest: { [weak self] in self?.showSpeedTest() }))
+        let host = NSHostingController(rootView: ContentView(m: model, showSpeedTest: { [weak self] in self?.showSpeedTest() }))
+        host.sizingOptions = [.intrinsicContentSize, .preferredContentSize]
+        popover.contentViewController = host
+        sizePopoverToContent()
         item.button?.target = self
         item.button?.action = #selector(toggle)
         model.onChange = { [weak self] in self?.updateIcon() }
@@ -803,8 +809,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if popover.isShown { popover.performClose(nil); return }
         model.refresh()
         model.updateOrder(force: true)
+        sizePopoverToContent()
         popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
+    }
+
+    private func sizePopoverToContent() {
+        guard let host = popover.contentViewController as? NSHostingController<ContentView> else { return }
+        // Give AppKit a real size before it chooses a screen position. With an absent driver the network list is omitted;
+        // a zero/default hosting size can otherwise place that short menu far below its status item.
+        host.view.layoutSubtreeIfNeeded()
+        let size = host.sizeThatFits(in: NSSize(width: 330, height: CGFloat.greatestFiniteMagnitude))
+        host.preferredContentSize = size
+        popover.contentSize = size
     }
 
     // Closing the popover goes back to the list: reopening it on the half-filled password form was easy to mistake for a
