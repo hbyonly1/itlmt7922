@@ -127,12 +127,17 @@ IOReturn itlmt7922::ucJoin(const char *ssid, const char *psk)
 {
     if (shouldStop() || !m3On || !cmdLock || !wstate[0]) return kIOReturnNotReady;
     IOLockLock(cmdLock);
+    if (shouldStop() || userJoinStopped) { IOLockUnlock(cmdLock); return kIOReturnNotReady; }
     strlcpy(reqNet.ssid, ssid, sizeof(reqNet.ssid));
     strlcpy(reqNet.psk, psk, sizeof(reqNet.psk));
     reqNet.hasPmk = false;
     reqNet.native = false;
     bzero(reqNet.pmk, sizeof(reqNet.pmk));
     cmdBits = (cmdBits & ~(uint32_t)CMD_DISCONNECT) | (uint32_t)CMD_JOIN;
+    userJoinPending = true;
+    strlcpy(userJoinSsid, ssid, sizeof(userJoinSsid));
+    setProperty("wifi-join-succeeded", kOSBooleanFalse);
+    setProperty("wifi-join-pending", kOSBooleanTrue);
     IOLockUnlock(cmdLock);
     return kIOReturnSuccess;
 }
@@ -141,8 +146,13 @@ IOReturn itlmt7922::ucDisconnect()
 {
     if (shouldStop() || !m3On || !cmdLock || !wstate[0]) return kIOReturnNotReady;
     IOLockLock(cmdLock);
+    if (shouldStop() || userJoinStopped) { IOLockUnlock(cmdLock); return kIOReturnNotReady; }
     cmdBits = (cmdBits & ~(uint32_t)CMD_JOIN) | (uint32_t)CMD_DISCONNECT;
     bzero(&reqNet, sizeof(reqNet));
+    userJoinPending = false;
+    bzero(userJoinSsid, sizeof(userJoinSsid));
+    setProperty("wifi-join-succeeded", kOSBooleanFalse);
+    setProperty("wifi-join-pending", kOSBooleanFalse);
     IOLockUnlock(cmdLock);
     return kIOReturnSuccess;
 }
@@ -160,6 +170,24 @@ uint32_t itlmt7922::cmdTake(uint32_t mask, Net *join)
     }
     IOLockUnlock(cmdLock);
     return got;
+}
+
+// Complete only the request the worker took: a newer join still in the mailbox stays pending.
+void itlmt7922::finishUserJoin(bool stopped, bool succeeded)
+{
+    if (!cmdLock) return;
+    IOLockLock(cmdLock);
+    if (stopped) userJoinStopped = true;
+    if (stopped || !(cmdBits & CMD_JOIN)) {
+        if (userJoinPending) {
+            bool joined = succeeded && !strcmp(m3ssid, userJoinSsid);
+            setProperty("wifi-join-succeeded", joined ? kOSBooleanTrue : kOSBooleanFalse);
+        }
+        userJoinPending = false;
+        bzero(userJoinSsid, sizeof(userJoinSsid));
+        setProperty("wifi-join-pending", kOSBooleanFalse);
+    }
+    IOLockUnlock(cmdLock);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------
@@ -664,6 +692,7 @@ void itlmt7922::m3Supervise()
                 haveUser = false;
                 want = nb > 0;                                           // the configured networks, if any, take over again
                 wifiState("failed", why);
+                finishUserJoin();
                 m3log("supervisor: giving up on the joined network: %s", why);
             } else {
                 wifiState(wasUp ? "connecting" : "failed", why);
@@ -673,4 +702,5 @@ void itlmt7922::m3Supervise()
         m3PumpOnce();                                                    // idle: keep the rings drained
         IOSleep(50);
     }
+    finishUserJoin(true);
 }

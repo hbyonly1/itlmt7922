@@ -174,6 +174,8 @@ bool itlmt7922::start(IOService *provider)
     nativeMode = PE_parse_boot_argn("mt7922_native_dp", &nativeDP, sizeof(nativeDP)) && nativeDP;
     setProperty("port-version","0.2.2-full-experimental");
     setProperty("wifi-state", "off");                         // until stage 3 establishes a link
+    setProperty("wifi-join-succeeded", kOSBooleanFalse);
+    setProperty("wifi-join-pending", kOSBooleanFalse);
 
     pci = OSDynamicCast(IOPCIDevice, provider);
     if (!pci) { IOLog("itlmt7922: provider is not IOPCIDevice\n"); return false; }

@@ -18,6 +18,8 @@ struct WifiNet { let ssid: String; let channel: Int; let rssi: Int; let security
 
 struct WifiStatus {
     var present = false, state = "absent", error = "", ssid = "", channel = 0, rssi = 0, rate = 0, scanGen = 0
+    var joinPending: Bool?                    // nil: older kext without the join-lifecycle property
+    var joinSucceeded: Bool?                  // latched user-request result, independent of later link/default-network changes
     var nets: [WifiNet] = []
     var events: [String] = []                   // wifi-events: "<seconds since boot>s <what happened>", oldest first
 }
@@ -35,6 +37,9 @@ enum Driver {
         func prop(_ k: String) -> Any? { IORegistryEntryCreateCFProperty(svc, k as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() }
         func num(_ k: String) -> Int { (prop(k) as? NSNumber).map { Int(Int32(truncatingIfNeeded: $0.int64Value)) } ?? 0 }
         s.present = true
+        // Read this before the result: the kext publishes connected/SSID before clearing the pending flag.
+        s.joinPending = (prop("wifi-join-pending") as? NSNumber)?.boolValue
+        s.joinSucceeded = (prop("wifi-join-succeeded") as? NSNumber)?.boolValue
         s.state = prop("wifi-state") as? String ?? "off"
         s.error = prop("wifi-error") as? String ?? ""
         s.ssid = prop("wifi-ssid") as? String ?? ""
@@ -107,8 +112,9 @@ enum LoginItem {
     static var enabled: Bool { FileManager.default.fileExists(atPath: plist.path) }
     static func set(_ on: Bool) {
         if !on {
-            launchctl(["bootout", "gui/\(getuid())", plist.path])
             try? FileManager.default.removeItem(at: plist)
+            // Removing the file disables the next login. bootout can kill this very app before it returns;
+            // leave the current RunAtLoad (not KeepAlive) instance running until the user quits.
             return
         }
         let exe = Bundle.main.executablePath ?? CommandLine.arguments[0]
@@ -116,8 +122,8 @@ enum LoginItem {
                                 "LimitLoadToSessionType": "Aqua"]
         try? FileManager.default.createDirectory(at: plist.deletingLastPathComponent(), withIntermediateDirectories: true)
         (d as NSDictionary).write(to: plist, atomically: true)
-        // Load it now instead of at the next login; a second instance exits on its own (see singleInstance).
-        launchctl(["bootout", "gui/\(getuid())", plist.path])
+        // Load it now when not already registered; a second instance exits on its own (see singleInstance).
+        // An already loaded job can reject bootstrap: the persisted file still enables the next login.
         launchctl(["bootstrap", "gui/\(getuid())", plist.path])
     }
     private static func launchctl(_ args: [String]) {
@@ -126,8 +132,10 @@ enum LoginItem {
         p.arguments = args
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
-        try? p.run()
-        p.waitUntilExit()
+        do {
+            try p.run()
+            p.waitUntilExit()
+        } catch { return }                    // waitUntilExit requires a successfully launched process
     }
 }
 
@@ -169,7 +177,6 @@ final class WifiModel: ObservableObject {
     private var seen: [String: WifiNet] = [:]   // last sighting of each SSID in the list
     private var missing: [String: Int] = [:]    // consecutive refreshes an SSID was absent
     private var eventsAtJoin = Set<String>()
-    private var failShown = false
     private var pendingSince = Date()
     private var reorderNext = false
 
@@ -186,8 +193,8 @@ final class WifiModel: ObservableObject {
     }
 
     var connected: Bool { st.state == "connected" }
-    var busy: Bool { st.state == "connecting" || st.state == "scanning" || scanPending }
-    var connectingSSID: String? { pending != nil && !connected ? pending?.ssid : nil }
+    var busy: Bool { st.joinPending == true || st.state == "connecting" || st.state == "scanning" || scanPending }
+    var connectingSSID: String? { pending?.ssid }
 
     func refresh() {
         let old = st
@@ -198,18 +205,31 @@ final class WifiModel: ObservableObject {
         if reorderNext && rescanned { reorderNext = false }
         if let p = pending {
             let fresh = st.events.filter { !eventsAtJoin.contains($0) }
-            if connected && st.ssid == p.ssid {
+            let succeeded: Bool
+            if st.joinPending == false, let result = st.joinSucceeded {
+                // A later disconnect or an EFI-default connection must not change this user's completed result.
+                succeeded = result
+            } else {
+                succeeded = connected && st.ssid == p.ssid && st.joinPending != true
+            }
+            if succeeded {
                 if p.remember { saved[p.ssid] = p.psk; SavedStore.save(saved) }
                 drafts[p.ssid] = nil
                 pending = nil; message = nil
                 if joinTarget != nil { joinTarget = nil }
-            } else if !failShown, let why = fresh.last(where: { Self.isFailure($0) }) {
-                failShown = true
-                pending = nil                    // a rejected password is not "still connecting": clear the spinner
-                message = "Could not join \(p.ssid): " + Self.friendly(why)
-            } else if Date().timeIntervalSince(pendingSince) > 45 && !busy {
-                pending = nil
-                if !failShown { message = "Could not join \(p.ssid): the access point did not answer in time. Try again once the network is back in the list." }
+            } else {
+                // A failed level can be followed by fallback/recovery. Only the kext's final result ends the request.
+                // Older kexts have no lifecycle flag, so retain the existing timeout as their fallback.
+                let finished = st.joinPending == false
+                let timedOut = st.joinPending == nil && Date().timeIntervalSince(pendingSince) > 45 && !busy
+                if finished || timedOut {
+                    pending = nil
+                    if let why = fresh.last(where: { Self.isFailure($0) }) {
+                        message = "Could not join \(p.ssid): " + Self.friendly(why)
+                    } else {
+                        message = "Could not join \(p.ssid): the access point did not answer in time. Try again once the network is back in the list."
+                    }
+                }
             }
         }
         if (st.state == "idle" || st.state == "failed") && !userOff && pending == nil && rescanned { autoJoin() }
@@ -285,10 +305,11 @@ final class WifiModel: ObservableObject {
     func join(_ ssid: String, _ psk: String, remember: Bool) {
         guard (1...32).contains(ssid.utf8.count) else { message = "The network name must be 1-32 bytes."; return }
         guard (8...63).contains(psk.utf8.count) else { message = "The password must be 8-63 characters."; return }
-        eventsAtJoin = Set(st.events)
+        let priorEvents = Set(st.events)
         let kr = Driver.join(ssid: ssid, psk: psk)
         if kr != KERN_SUCCESS { message = "Could not join \(ssid): " + explain(kr); return }
-        userOff = false; message = nil; failShown = false; pendingSince = Date()
+        eventsAtJoin = priorEvents
+        userOff = false; message = nil; pendingSince = Date()
         pending = (ssid, psk, remember)
         refresh()
     }
@@ -320,7 +341,7 @@ final class WifiModel: ObservableObject {
 
     // At start and after scans while not connected: join the strongest saved network in range, once per network.
     func autoJoin() {
-        guard st.present, !userOff, pending == nil, st.state == "idle" || st.state == "failed" else { return }
+        guard st.present, !userOff, pending == nil, st.joinPending != true, st.state == "idle" || st.state == "failed" else { return }
         guard let n = st.nets.first(where: { saved[$0.ssid] != nil && $0.joinable && !autoTried.contains($0.ssid) }),
               let psk = saved[n.ssid] else { return }
         autoTried.insert(n.ssid)
@@ -409,7 +430,7 @@ struct JoinView: View {
 
     var ssid: String { if case .network(let s) = target { return s } else { return name } }
     var key: String { if case .network(let s) = target { return s } else { return "" } }
-    var attempting: Bool { m.pending != nil && m.pending?.ssid == ssid && !m.connected && m.message == nil }
+    var attempting: Bool { m.connectingSSID == ssid }
     var valid: Bool { (1...32).contains(ssid.utf8.count) && (8...63).contains(psk.utf8.count) }
 
     var body: some View {

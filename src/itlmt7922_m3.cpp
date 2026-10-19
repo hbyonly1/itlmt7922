@@ -1295,6 +1295,7 @@ void itlmt7922::m3Link()
     tgtRssi = 0;
     wifiState("connected", "");
     wifiLink();
+    finishUserJoin(false, true);
     if (njState == ITL_NATIVE_CONNECTING) njState = ITL_NATIVE_UP;   // the join the Family asked for (before its link callback)
     // Native publication may wake DHCP immediately. Radio TX/session state
     // must already be ready before entering the Family link transition.

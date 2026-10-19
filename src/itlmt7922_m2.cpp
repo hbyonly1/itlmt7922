@@ -163,9 +163,17 @@ void itlmt7922::rxParseFrame(const uint8_t *p,uint32_t length)
 int itlmt7922::m2Scan(const char *ssid)
 {
     int rc = m2ScanPass(ssid, 0);
-    if (ssid) return rc;                                  // a directed scan only needs the primary list
-    int rcDfs = m2ScanPass(nullptr, 1);                   // UNII-2C DFS block
-    return rc ? rc : rcDfs;
+    if (rc) return rc;
+    if (shouldStop()) return -125;
+    if (firmwareFault) return -5;
+    if (ssid) return 0;                                  // a directed scan only needs the primary list
+    int rcDfs = m2ScanPass(nullptr, 1);                   // optional passive DFS pass
+    if (shouldStop()) return -125;
+    if (firmwareFault) return -5;
+    // Some firmware/domain combinations reject DFS or never complete that
+    // pass. Keep the successful primary scan usable instead of aborting M2.
+    if (rcDfs) m2log("optional DFS scan rc=%d; keeping primary results", rcDfs);
+    return 0;
 }
 
 int itlmt7922::m2ScanPass(const char *ssid, int part)

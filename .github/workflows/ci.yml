@@ -46,6 +46,8 @@ jobs:
           persist-credentials: false
       - name: Verify SDK pin
         run: test "$(git -C build/MacKernelSDK rev-parse HEAD)" = 3f750085caa17ec3a7880f11c11bf4f48cd6a164
+      - name: Test menu application connection and login state
+        run: sh tests/run_app_tests.sh
       - name: Build x86_64 kext and menu application
         run: bash scripts/build.sh
       - name: Package and check release contents

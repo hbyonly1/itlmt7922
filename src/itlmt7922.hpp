@@ -420,9 +420,13 @@ private:
     IOLock *cmdLock = nullptr;
     volatile uint32_t cmdBits = 0;
     Net reqNet = {};                         // the network of the last join command (under cmdLock)
+    bool userJoinPending = false;            // active legacy request (under cmdLock); its result survives automatic reconnects
+    char userJoinSsid[33] = {0};              // the request whose result is pending (under cmdLock)
+    bool userJoinStopped = false;            // supervisor exited; legacy joins must not queue without a worker (under cmdLock)
     uint32_t lastScanReqMs = 0;
     bool cmdPending(uint32_t mask) const { return (__atomic_load_n(&cmdBits, __ATOMIC_ACQUIRE) & mask) != 0; }
     uint32_t cmdTake(uint32_t mask, Net *join);
+    void finishUserJoin(bool stopped = false, bool succeeded = false);
     Net candNets[4] = {};                    // candidates for the next m3Run1(), in priority order
     int candN = 0;
     int loadPlistNets(Net *out, int max);
