@@ -32,7 +32,16 @@ void itlmt7922::m3log(const char *fmt, ...)
     va_end(ap);
     IOLog("itlmt7922: M3 %s\n", tmp);
     size_t n = strlen(tmp);
-    if (m3len + n + 2 < sizeof(m3buf)) {
+    if (n + 2 < sizeof(m3buf)) {
+        // Ring, not a one-shot buffer: appending only while there is room meant that after ~3 KB the log went silent, exactly
+        // when a repeated failure needed it. Drop the oldest ';'-separated entries instead.
+        while (m3len + n + 2 >= sizeof(m3buf)) {
+            char *sep = (char *)memchr(m3buf, ';', m3len);
+            size_t cut = sep ? (size_t)(sep - m3buf) + 1 : m3len;
+            memmove(m3buf, m3buf + cut, m3len - cut);
+            m3len -= cut;
+            m3buf[m3len] = 0;
+        }
         memcpy(m3buf + m3len, tmp, n);
         m3len += n;
         m3buf[m3len++] = ';';
@@ -65,6 +74,37 @@ void itlmt7922::m3Capture(const uint8_t *frame, uint32_t len, const char *ssid, 
     tgtCap = (uint16_t)(frame[34] | (frame[35] << 8));
     tgtIeLen = len - 36 > sizeof(tgtIe) ? (uint32_t)sizeof(tgtIe) : len - 36;
     memcpy(tgtIe, frame + 36, tgtIeLen);
+}
+
+// The passive wildcard scan already stores each beacon in aps[]; reuse that instead of sending a directed (active) probe.
+// Active probing is not allowed on DFS channels, so a 5 GHz AP on one of them could be listed by the scan and still never
+// be joined through m2Scan(m3ssid). Prefer a 5 GHz BSS over a 2.4 GHz one, as m3Capture does.
+bool itlmt7922::m3UseCached(const char *ssid, uint32_t maxAgeMs)
+{
+    const uint32_t now = nowMs();
+    int best = -1;
+    for (int i = 0; i < nAps; i++) {
+        const itl_ap &a = aps[i];
+        if (!a.ssid[0] || !a.ieLen || strcmp(a.ssid, ssid) != 0) continue;
+        if ((uint32_t)(now - a.seenMs) > maxAgeMs) continue;
+        if (best < 0) { best = i; continue; }
+        const itl_ap &b = aps[best];
+        const bool a5 = a.ch > 14, b5 = b.ch > 14;
+        if (a5 != b5) { if (a5) best = i; continue; }
+        if (a.rssi > b.rssi) best = i;
+    }
+    if (best < 0) return false;
+    const itl_ap &a = aps[best];
+    tgtFound = true;
+    memcpy(tgtBssid, a.bssid, 6);
+    tgtCh = a.ch;
+    tgtCap = a.cap;
+    tgtBcnInt = a.bcnInt;
+    tgtIeLen = a.ieLen > (uint16_t)sizeof(tgtIe) ? (uint32_t)sizeof(tgtIe) : a.ieLen;
+    memcpy(tgtIe, a.ie, tgtIeLen);
+    tgtRssi = a.rssi;
+    tgtLastBcnMs = a.seenMs ? a.seenMs : 1;
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -614,6 +654,13 @@ int itlmt7922::m3Run1()
             int i = order[k];
             strlcpy(m3ssid, nets[i].ssid, sizeof(m3ssid));
             tgtFound = false;
+            // Prefer the beacon the passive scan already stored (works for DFS channels too, where an active probe is not
+            // allowed); only probe when the AP was not heard in the last minute.
+            if (m3UseCached(m3ssid, 60000)) {
+                m3log("cached net%d ssid len=%u", i + 1, (unsigned)strlen(m3ssid));
+                sel = i;
+                break;
+            }
             m3log("scan #%d for net%d (directed)", attempt, i + 1);
             m2Scan(m3ssid);
             for (int w = 0; w < 5 && !tgtFound && !shouldStop() && !firmwareFault; w++) { rxDataPoll(); IOSleep(100); }
@@ -650,10 +697,18 @@ int itlmt7922::m3Run1()
     m3ParseAp();
     int prepRc = m3HwPrep();
     if (prepRc) { m3Publish("hw-prep-fail"); return prepRc; }
-    int setupRc=m3Bss(false);
-    if (!setupRc) setupRc=m3Sta(0,true,0);
-    if (!setupRc) setupRc=m3Roc(true);
-    if (setupRc) return setupRc;
+    // Each setup step used to return without publishing anything, so every failure below looked like "connection failed"
+    // with m3-res still on "pmk". Name the step, and never leave a ROC behind: the next attempt would fail the same way.
+    const char *setupStage = "bss-fail";
+    int setupRc = m3Bss(false);
+    if (!setupRc) { setupStage = "sta-fail"; setupRc = m3Sta(0, true, 0); }
+    if (!setupRc) { setupStage = "roc-setup-fail"; setupRc = m3Roc(true); }
+    if (setupRc) {
+        m3Publish(setupStage);
+        evLog("setup failed: %s rc=%d", setupStage, setupRc);
+        m3Roc(false);
+        return setupRc;
+    }
     for (int i = 0; i < 1000 && !rocGrant && !shouldStop() && !firmwareFault; i++) m3Pump(1);
     m3log("roc grant=%d status=%u", rocGrant ? 1 : 0, rocStatus);
     if (!rocGrant || rocStatus != 0) { m3Publish("roc-fail"); m3Roc(false); return ITL_EIO; }
@@ -740,6 +795,7 @@ void itlmt7922::m3Teardown()
     m3Tx(f, sizeof(f), 0, 12);
     IOSleep(100);
     m3Bss(false);                                            // BSS back to "not connected"
+    m3Roc(false);                                            // an earlier attempt may have returned before releasing it
     m3dataOn = false;
     m3cipher = 0;
     IOSleep(100);
@@ -1239,6 +1295,7 @@ void itlmt7922::m3Link()
     tgtRssi = 0;
     wifiState("connected", "");
     wifiLink();
+    finishUserJoin(false, true);
     if (njState == ITL_NATIVE_CONNECTING) njState = ITL_NATIVE_UP;   // the join the Family asked for (before its link callback)
     // Native publication may wake DHCP immediately. Radio TX/session state
     // must already be ready before entering the Family link transition.

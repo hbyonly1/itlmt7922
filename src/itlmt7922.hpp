@@ -141,6 +141,7 @@ private:
     void m2Publish();
     int  m2Run();
     int  m2Scan(const char *ssid);
+    int  m2ScanPass(const char *ssid, int part);
     uint8_t scanSeq = 0;
     uint32_t scanMs = 0, evLogged = 0;
     uint8_t chHist[200] = {0};
@@ -164,6 +165,7 @@ private:
     void m3Publish(const char *stage);
     int  m3Run();
     void m3Capture(const uint8_t *frame, uint32_t len, const char *ssid, uint8_t ch);
+    bool m3UseCached(const char *ssid, uint32_t maxAgeMs);
     int  m3Cmd(uint8_t cid, const void *payload, size_t plen, const char *name);
     int  m3HwPrep();
     void ctlPoll();                          // link loop: take run-time control requests (setProperties)
@@ -418,9 +420,13 @@ private:
     IOLock *cmdLock = nullptr;
     volatile uint32_t cmdBits = 0;
     Net reqNet = {};                         // the network of the last join command (under cmdLock)
+    bool userJoinPending = false;            // active legacy request (under cmdLock); its result survives automatic reconnects
+    char userJoinSsid[33] = {0};              // the request whose result is pending (under cmdLock)
+    bool userJoinStopped = false;            // supervisor exited; legacy joins must not queue without a worker (under cmdLock)
     uint32_t lastScanReqMs = 0;
     bool cmdPending(uint32_t mask) const { return (__atomic_load_n(&cmdBits, __ATOMIC_ACQUIRE) & mask) != 0; }
     uint32_t cmdTake(uint32_t mask, Net *join);
+    void finishUserJoin(bool stopped = false, bool succeeded = false);
     Net candNets[4] = {};                    // candidates for the next m3Run1(), in priority order
     int candN = 0;
     int loadPlistNets(Net *out, int max);

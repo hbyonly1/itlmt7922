@@ -21,9 +21,7 @@ Preserve original author and third-party notices. For a hardware layout change, 
 Run the relevant host checks and build on macOS:
 
 ```sh
-sh tests/run_codec_tests.sh
-sh tests/run_protocol_tests.sh
-sh tests/run_power_tests.sh
+bash tests/run_all.sh
 bash scripts/build.sh
 ```
 
